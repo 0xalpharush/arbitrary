@@ -500,6 +500,235 @@ fn gen_constructor_for_field(field: &Field) -> Result<TokenStream> {
     Ok(ctor)
 }
 
+// =============================================================================
+// #[derive(Dearbitrary)]
+// =============================================================================
+
+#[proc_macro_derive(Dearbitrary, attributes(arbitrary))]
+pub fn derive_dearbitrary(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(tokens as syn::DeriveInput);
+    expand_derive_dearbitrary(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_derive_dearbitrary(input: syn::DeriveInput) -> Result<TokenStream> {
+    let container_attrs = ContainerAttributes::from_derive_input(&input)?;
+
+    let write_to_method = gen_dearbitrary_method(&input)?;
+    let name = &input.ident;
+
+    // Apply bounds: each type param needs `Dearbitrary` instead of `Arbitrary`.
+    let generics = apply_dearbitrary_bounds(input.generics.clone(), &container_attrs)?;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics arbitrary::Dearbitrary for #name #ty_generics #where_clause {
+            #write_to_method
+        }
+    })
+}
+
+fn apply_dearbitrary_bounds(
+    mut generics: Generics,
+    container_attrs: &ContainerAttributes,
+) -> Result<Generics> {
+    if container_attrs.bounds.is_some() {
+        // User-supplied bounds: don't add automatic Dearbitrary bounds
+        // (they should add them manually via the attribute)
+        return Ok(generics);
+    }
+    for param in generics.params.iter_mut() {
+        if let GenericParam::Type(type_param) = param {
+            type_param.bounds.push(parse_quote!(arbitrary::Dearbitrary));
+        }
+    }
+    Ok(generics)
+}
+
+fn gen_dearbitrary_method(input: &DeriveInput) -> Result<TokenStream> {
+    match &input.data {
+        Data::Struct(data) => gen_dearbitrary_struct(&data.fields),
+        Data::Enum(data) => gen_dearbitrary_enum(data, &input.ident),
+        Data::Union(data) => gen_dearbitrary_struct(&Fields::Named(data.fields.clone())),
+    }
+}
+
+fn gen_dearbitrary_struct(fields: &Fields) -> Result<TokenStream> {
+    let field_writes = gen_dearbitrary_field_writes(fields, &quote!(self))?;
+
+    Ok(quote! {
+        fn write_to(&self, s: &mut arbitrary::Structured) {
+            #field_writes
+        }
+    })
+}
+
+fn gen_dearbitrary_field_writes(fields: &Fields, self_prefix: &TokenStream) -> Result<TokenStream> {
+    let writes: Vec<TokenStream> = match fields {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|f| {
+                let name = f.ident.as_ref().unwrap();
+                let ctor = determine_field_constructor(f)?;
+                Ok(match ctor {
+                    FieldConstructor::Default | FieldConstructor::Value(_) => {
+                        // Default/fixed fields don't consume bytes during reading,
+                        // so don't write any during dearbitrary.
+                        quote!()
+                    }
+                    FieldConstructor::Arbitrary => {
+                        quote! {
+                            arbitrary::Dearbitrary::write_to(&#self_prefix.#name, s);
+                        }
+                    }
+                    FieldConstructor::With(_) => {
+                        // Custom constructors: best-effort, write as Dearbitrary
+                        quote! {
+                            arbitrary::Dearbitrary::write_to(&#self_prefix.#name, s);
+                        }
+                    }
+                })
+            })
+            .collect::<Result<_>>()?,
+        Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let idx = syn::Index::from(i);
+                let ctor = determine_field_constructor(f)?;
+                Ok(match ctor {
+                    FieldConstructor::Default | FieldConstructor::Value(_) => quote!(),
+                    FieldConstructor::Arbitrary | FieldConstructor::With(_) => {
+                        quote! {
+                            arbitrary::Dearbitrary::write_to(&#self_prefix.#idx, s);
+                        }
+                    }
+                })
+            })
+            .collect::<Result<_>>()?,
+        Fields::Unit => vec![],
+    };
+
+    Ok(quote! { #(#writes)* })
+}
+
+fn gen_dearbitrary_enum(data: &DataEnum, enum_name: &Ident) -> Result<TokenStream> {
+    let variants: Vec<_> = data.variants.iter().filter(not_skipped).collect();
+    let count = variants.len() as u64;
+
+    if variants.is_empty() {
+        return Err(Error::new_spanned(
+            enum_name,
+            "Enum must have at least one variant for Dearbitrary",
+        ));
+    }
+
+    let arms: Vec<TokenStream> = variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let variant_name = &variant.ident;
+            let index = index as u64;
+
+            // Compute u32 value that reverses the Lemire multiply-shift:
+            //   (u64::from(v) * count) >> 32 == index
+            // v must be in [index * 2^32 / count, (index+1) * 2^32 / count).
+            // Use the midpoint: v = (2*index + 1) * 2^32 / (2*count).
+            let variant_u32 = if count == 1 {
+                quote!(0u32) // any value works for single-variant enums
+            } else {
+                quote! {
+                    (((2 * #index + 1) as u64 * (1u64 << 32)) / (2 * #count)) as u32
+                }
+            };
+
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let field_names: Vec<_> = named
+                        .named
+                        .iter()
+                        .map(|f| f.ident.as_ref().unwrap())
+                        .collect();
+                    let field_writes: Vec<TokenStream> = named
+                        .named
+                        .iter()
+                        .map(|f| {
+                            let name = f.ident.as_ref().unwrap();
+                            let ctor = determine_field_constructor(f).unwrap();
+                            match ctor {
+                                FieldConstructor::Default | FieldConstructor::Value(_) => quote!(),
+                                FieldConstructor::Arbitrary | FieldConstructor::With(_) => {
+                                    quote! {
+                                        arbitrary::Dearbitrary::write_to(#name, s);
+                                    }
+                                }
+                            }
+                        })
+                        .collect();
+
+                    quote! {
+                        #enum_name::#variant_name { #(ref #field_names),* } => {
+                            let __variant_selector: u32 = #variant_u32;
+                            arbitrary::Dearbitrary::write_to(&__variant_selector, s);
+                            #(#field_writes)*
+                        }
+                    }
+                }
+                Fields::Unnamed(unnamed) => {
+                    let field_names: Vec<Ident> = (0..unnamed.unnamed.len())
+                        .map(|i| Ident::new(&format!("__field{}", i), Span::call_site()))
+                        .collect();
+                    let field_writes: Vec<TokenStream> = unnamed
+                        .unnamed
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let name = &field_names[i];
+                            let ctor = determine_field_constructor(f).unwrap();
+                            match ctor {
+                                FieldConstructor::Default | FieldConstructor::Value(_) => quote!(),
+                                FieldConstructor::Arbitrary | FieldConstructor::With(_) => {
+                                    quote! {
+                                        arbitrary::Dearbitrary::write_to(#name, s);
+                                    }
+                                }
+                            }
+                        })
+                        .collect();
+
+                    quote! {
+                        #enum_name::#variant_name(#(ref #field_names),*) => {
+                            let __variant_selector: u32 = #variant_u32;
+                            arbitrary::Dearbitrary::write_to(&__variant_selector, s);
+                            #(#field_writes)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! {
+                        #enum_name::#variant_name => {
+                            let __variant_selector: u32 = #variant_u32;
+                            arbitrary::Dearbitrary::write_to(&__variant_selector, s);
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    Ok(quote! {
+        fn write_to(&self, s: &mut arbitrary::Structured) {
+            match self {
+                #(#arms)*
+            }
+        }
+    })
+}
+
 fn check_variant_attrs(variant: &Variant) -> Result<()> {
     for attr in &variant.attrs {
         if attr.path().is_ident(ARBITRARY_ATTRIBUTE_NAME) {

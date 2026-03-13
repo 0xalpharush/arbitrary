@@ -80,7 +80,9 @@ fn test_take_rest() {
     assert_eq!(s2.1, true);
     assert_eq!(s1.2, 0x4030201);
     assert_eq!(s2.2, 0x4030201);
-    assert_eq!(s1.3, vec![0x0706]);
+    // With separator-based iteration, all remaining bytes become elements
+    // (no coin-flip bools between elements). [5,6,7,8] -> two u16s.
+    assert_eq!(s1.3, vec![0x0605, 0x0807]);
     assert_eq!(s2.3, "\x05\x06\x07\x08");
 }
 
@@ -417,4 +419,106 @@ fn derive_structs_named_same_as_core() {
     }
 
     let _ = Result::arbitrary(&mut Unstructured::new(&[]));
+}
+
+// =============================================================================
+// Dearbitrary derive tests
+// =============================================================================
+
+fn dearbitrary_roundtrip<T: Dearbitrary + PartialEq + std::fmt::Debug>(value: &T) {
+    let bytes = value.to_arbitrary_bytes();
+    let mut u = Unstructured::new(&bytes);
+    let parsed = T::arbitrary(&mut u).expect("roundtrip parse failed");
+    assert_eq!(value, &parsed, "roundtrip failed: bytes={:?}", bytes);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct SimpleStruct {
+    a: u8,
+    b: u32,
+    c: bool,
+}
+
+#[test]
+fn dearbitrary_simple_struct() {
+    dearbitrary_roundtrip(&SimpleStruct {
+        a: 42,
+        b: 0xDEADBEEF,
+        c: true,
+    });
+    dearbitrary_roundtrip(&SimpleStruct {
+        a: 0,
+        b: 0,
+        c: false,
+    });
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct TupleStruct(u16, u8);
+
+#[test]
+fn dearbitrary_tuple_struct() {
+    dearbitrary_roundtrip(&TupleStruct(1234, 56));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct StructWithVec {
+    name: String,
+    values: Vec<u32>,
+}
+
+#[test]
+fn dearbitrary_struct_with_vec() {
+    dearbitrary_roundtrip(&StructWithVec {
+        name: "hello".into(),
+        values: vec![1, 2, 3],
+    });
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+enum SimpleEnum {
+    A,
+    B(u32),
+    C { x: u8, y: u16 },
+}
+
+#[test]
+fn dearbitrary_enum() {
+    dearbitrary_roundtrip(&SimpleEnum::A);
+    dearbitrary_roundtrip(&SimpleEnum::B(42));
+    dearbitrary_roundtrip(&SimpleEnum::C { x: 1, y: 2 });
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct NestedStruct {
+    inner: SimpleStruct,
+    opt: Option<u32>,
+}
+
+#[test]
+fn dearbitrary_nested() {
+    dearbitrary_roundtrip(&NestedStruct {
+        inner: SimpleStruct {
+            a: 1,
+            b: 2,
+            c: true,
+        },
+        opt: Some(99),
+    });
+    dearbitrary_roundtrip(&NestedStruct {
+        inner: SimpleStruct {
+            a: 0,
+            b: 0,
+            c: false,
+        },
+        opt: None,
+    });
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct UnitStruct;
+
+#[test]
+fn dearbitrary_unit_struct() {
+    dearbitrary_roundtrip(&UnitStruct);
 }

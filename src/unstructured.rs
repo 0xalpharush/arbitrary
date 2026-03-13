@@ -71,6 +71,51 @@ use std::{mem, ops};
 #[derive(Debug)]
 pub struct Unstructured<'a> {
     data: &'a [u8],
+    separator_depth: u8,
+}
+
+/// The base magic separator bytes used to delimit collection elements.
+/// Nested collections XOR each byte with the depth to use distinct separators.
+pub(crate) const SEPARATOR_MAGIC: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+
+/// Compute the separator magic bytes for a given nesting depth.
+pub(crate) fn separator_for_depth(depth: u8) -> [u8; 4] {
+    [
+        SEPARATOR_MAGIC[0] ^ depth,
+        SEPARATOR_MAGIC[1] ^ depth,
+        SEPARATOR_MAGIC[2] ^ depth,
+        SEPARATOR_MAGIC[3] ^ depth,
+    ]
+}
+
+/// Find the first occurrence of a 4-byte separator in `data`.
+fn find_separator(data: &[u8], separator: &[u8; 4]) -> Option<usize> {
+    if data.len() < 4 {
+        return None;
+    }
+    data.windows(4).position(|w| w == separator)
+}
+
+/// Split `data` on occurrences of `separator`, returning the chunks between separators.
+fn split_on_separator<'a>(data: &'a [u8], separator: &[u8; 4]) -> Vec<&'a [u8]> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = data;
+    loop {
+        match find_separator(remaining, separator) {
+            Some(pos) => {
+                chunks.push(&remaining[..pos]);
+                remaining = &remaining[pos + 4..];
+            }
+            None => {
+                chunks.push(remaining);
+                break;
+            }
+        }
+    }
+    chunks
 }
 
 impl<'a> Unstructured<'a> {
@@ -84,7 +129,26 @@ impl<'a> Unstructured<'a> {
     /// let u = Unstructured::new(&[1, 2, 3, 4]);
     /// ```
     pub fn new(data: &'a [u8]) -> Self {
-        Unstructured { data }
+        Unstructured {
+            data,
+            separator_depth: 0,
+        }
+    }
+
+    /// Create a new `Unstructured` with a specific separator nesting depth.
+    ///
+    /// This is used internally when parsing collection elements, so that
+    /// nested collections use distinct separator patterns.
+    fn new_with_depth(data: &'a [u8], separator_depth: u8) -> Self {
+        Unstructured {
+            data,
+            separator_depth,
+        }
+    }
+
+    /// Get the separator magic bytes for the current nesting depth.
+    fn separator_magic(&self) -> [u8; 4] {
+        separator_for_depth(self.separator_depth)
     }
 
     /// Get the number of remaining bytes of underlying data that are still
@@ -220,6 +284,12 @@ impl<'a> Unstructured<'a> {
         let elem_size = upper.unwrap_or(lower * 2);
         let elem_size = std::cmp::max(1, elem_size);
         Ok(byte_size / elem_size)
+    }
+
+    /// Test-only accessor for `arbitrary_byte_size`.
+    #[cfg(test)]
+    pub(crate) fn arbitrary_byte_size_for_test(&mut self) -> usize {
+        self.arbitrary_byte_size().unwrap()
     }
 
     fn arbitrary_byte_size(&mut self) -> Result<usize> {
@@ -655,15 +725,45 @@ impl<'a> Unstructured<'a> {
         mem::take(&mut self.data)
     }
 
-    /// Provide an iterator over elements for constructing a collection
+    /// Provide an iterator over elements for constructing a collection.
+    ///
+    /// For fixed-size elements (where `size_hint` upper == lower), uses a
+    /// count-based approach: determines byte budget, divides into equal chunks.
+    ///
+    /// For variable-size elements, uses a magic separator (`0xDEADBEEF` XOR'd
+    /// with nesting depth) to delimit elements within the byte budget. This
+    /// ensures small changes to one element don't cascade into structural
+    /// changes for other elements.
     ///
     /// This is useful for implementing [`Arbitrary::arbitrary`] on collections
     /// since the implementation is simply `u.arbitrary_iter()?.collect()`
-    pub fn arbitrary_iter<'b, ElementType: Arbitrary<'a>>(
-        &'b mut self,
-    ) -> Result<ArbitraryIter<'a, 'b, ElementType>> {
+    pub fn arbitrary_iter<ElementType: Arbitrary<'a>>(
+        &mut self,
+    ) -> Result<ArbitraryIter<'a, ElementType>> {
+        let byte_size = self.arbitrary_byte_size()?;
+        let collection_data = self.bytes(byte_size)?;
+
+        let (lower, upper) = ElementType::size_hint(0);
+        let is_fixed_size = upper == Some(lower) && lower > 0;
+
+        let chunks = if is_fixed_size {
+            // Fixed-size elements: split into exact-sized chunks.
+            // No separator needed since element boundaries are deterministic.
+            collection_data
+                .chunks(lower)
+                .filter(|c| c.len() == lower)
+                .collect()
+        } else {
+            // Variable-size elements: split on magic separator.
+            let separator = self.separator_magic();
+            split_on_separator(collection_data, &separator)
+        };
+
         Ok(ArbitraryIter {
-            u: &mut *self,
+            chunks,
+            index: 0,
+            separator_depth: self.separator_depth,
+            fixed_size: is_fixed_size,
             _marker: PhantomData,
         })
     }
@@ -671,13 +771,32 @@ impl<'a> Unstructured<'a> {
     /// Provide an iterator over elements for constructing a collection from
     /// all the remaining bytes.
     ///
+    /// Like [`arbitrary_iter`](Self::arbitrary_iter) but consumes all remaining
+    /// data instead of using a byte budget.
+    ///
     /// This is useful for implementing [`Arbitrary::arbitrary_take_rest`] on collections
     /// since the implementation is simply `u.arbitrary_take_rest_iter()?.collect()`
     pub fn arbitrary_take_rest_iter<ElementType: Arbitrary<'a>>(
         self,
     ) -> Result<ArbitraryTakeRestIter<'a, ElementType>> {
+        let (lower, upper) = ElementType::size_hint(0);
+        let is_fixed_size = upper == Some(lower) && lower > 0;
+
+        let chunks = if is_fixed_size {
+            self.data
+                .chunks(lower)
+                .filter(|c| c.len() == lower)
+                .collect()
+        } else {
+            let separator = self.separator_magic();
+            split_on_separator(self.data, &separator)
+        };
+
         Ok(ArbitraryTakeRestIter {
-            u: self,
+            chunks,
+            index: 0,
+            separator_depth: self.separator_depth,
+            fixed_size: is_fixed_size,
             _marker: PhantomData,
         })
     }
@@ -765,38 +884,81 @@ impl<'a> Unstructured<'a> {
     }
 }
 
-/// Utility iterator produced by [`Unstructured::arbitrary_iter`]
-pub struct ArbitraryIter<'a, 'b, ElementType> {
-    u: &'b mut Unstructured<'a>,
+/// Utility iterator produced by [`Unstructured::arbitrary_iter`].
+///
+/// For fixed-size elements, splits data into exact-sized chunks and parses
+/// each with [`Arbitrary::arbitrary`].
+///
+/// For variable-size elements, splits on magic separators and parses each
+/// chunk with [`Arbitrary::arbitrary_take_rest`] since the chunk is the
+/// element's complete data. Nested collections automatically use a different
+/// separator pattern (XOR'd with depth) to avoid ambiguity.
+pub struct ArbitraryIter<'a, ElementType> {
+    chunks: Vec<&'a [u8]>,
+    index: usize,
+    separator_depth: u8,
+    /// When true, elements are fixed-size and we use `arbitrary`.
+    /// When false, elements are variable-size (separator-split) and we use
+    /// `arbitrary_take_rest` since each chunk is the element's complete data.
+    fixed_size: bool,
     _marker: PhantomData<ElementType>,
 }
 
-impl<'a, ElementType: Arbitrary<'a>> Iterator for ArbitraryIter<'a, '_, ElementType> {
+impl<'a, ElementType: Arbitrary<'a>> Iterator for ArbitraryIter<'a, ElementType> {
     type Item = Result<ElementType>;
     fn next(&mut self) -> Option<Result<ElementType>> {
-        let keep_going = self.u.arbitrary().unwrap_or(false);
-        if keep_going {
-            Some(Arbitrary::arbitrary(self.u))
-        } else {
-            None
+        loop {
+            if self.index >= self.chunks.len() {
+                return None;
+            }
+            let chunk = self.chunks[self.index];
+            self.index += 1;
+            // Skip empty chunks (e.g. from consecutive separators)
+            if chunk.is_empty() {
+                continue;
+            }
+            if self.fixed_size {
+                let mut u = Unstructured::new_with_depth(chunk, self.separator_depth + 1);
+                return Some(ElementType::arbitrary(&mut u));
+            } else {
+                let u = Unstructured::new_with_depth(chunk, self.separator_depth + 1);
+                return Some(ElementType::arbitrary_take_rest(u));
+            }
         }
     }
 }
 
-/// Utility iterator produced by [`Unstructured::arbitrary_take_rest_iter`]
+/// Utility iterator produced by [`Unstructured::arbitrary_take_rest_iter`].
+///
+/// Like [`ArbitraryIter`] but consumes all remaining data.
 pub struct ArbitraryTakeRestIter<'a, ElementType> {
-    u: Unstructured<'a>,
+    chunks: Vec<&'a [u8]>,
+    index: usize,
+    separator_depth: u8,
+    fixed_size: bool,
     _marker: PhantomData<ElementType>,
 }
 
 impl<'a, ElementType: Arbitrary<'a>> Iterator for ArbitraryTakeRestIter<'a, ElementType> {
     type Item = Result<ElementType>;
     fn next(&mut self) -> Option<Result<ElementType>> {
-        let keep_going = self.u.arbitrary().unwrap_or(false);
-        if keep_going {
-            Some(Arbitrary::arbitrary(&mut self.u))
-        } else {
-            None
+        loop {
+            if self.index >= self.chunks.len() {
+                return None;
+            }
+            let chunk = self.chunks[self.index];
+            self.index += 1;
+            // Skip empty chunks (e.g. from consecutive separators)
+            if chunk.is_empty() {
+                continue;
+            }
+            if self.fixed_size {
+                let mut u = Unstructured::new_with_depth(chunk, self.separator_depth + 1);
+                return Some(ElementType::arbitrary(&mut u));
+            } else {
+                let u = Unstructured::new_with_depth(chunk, self.separator_depth + 1);
+                return Some(ElementType::arbitrary_take_rest(u));
+            }
         }
     }
 }

@@ -22,9 +22,11 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused)]
 
+mod dearbitrary;
 mod error;
 mod foreign;
 pub mod size_hint;
+pub mod structured;
 pub mod unstructured;
 
 #[cfg(test)]
@@ -37,6 +39,11 @@ pub use derive_arbitrary::*;
 
 #[doc(inline)]
 pub use unstructured::Unstructured;
+
+#[doc(inline)]
+pub use structured::Structured;
+
+pub use dearbitrary::Dearbitrary;
 
 /// Error indicating that the maximum recursion depth has been reached while calculating [`Arbitrary::size_hint`]()
 #[derive(Debug, Clone)]
