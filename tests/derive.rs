@@ -476,6 +476,30 @@ fn dearbitrary_struct_with_vec() {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct StructWithManyCollections {
+    tag: u8,
+    bytes: Vec<u8>,
+    middle: u16,
+    words: Vec<u32>,
+    arrays: Vec<[u8; 32]>,
+    nested: Vec<CollectionBlock>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
+struct CollectionBlock {
+    choices: Vec<u8>,
+    keys: Vec<[u8; 32]>,
+    values: Vec<u64>,
+}
+
+#[test]
+fn dearbitrary_many_collections_from_empty_input() {
+    let mut u = Unstructured::new(&[]);
+    let value = StructWithManyCollections::arbitrary(&mut u).expect("empty input should parse");
+    dearbitrary_roundtrip(&value);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Arbitrary, Dearbitrary)]
 enum SimpleEnum {
     A,
     B(u32),

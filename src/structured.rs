@@ -31,11 +31,18 @@ pub struct Structured {
     /// Content bytes written front-to-back.
     content: Vec<u8>,
     /// Deferred byte-size values. Each entry is the desired `byte_size` that
-    /// `arbitrary_byte_size` should return. Stored in order of creation
-    /// (first push = outermost = goes at the very end of the output).
-    deferred_sizes: Vec<usize>,
+    /// `arbitrary_byte_size` should return, together with the content offset
+    /// where that call will happen while reading. Stored in read order (first
+    /// push = first size read = goes at the very end of the output).
+    deferred_sizes: Vec<DeferredSize>,
     /// Current separator nesting depth.
     separator_depth: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredSize {
+    start: usize,
+    byte_size: usize,
 }
 
 impl Structured {
@@ -102,7 +109,10 @@ impl Structured {
     /// The size suffix will be appended to the end of the output buffer
     /// when [`into_bytes`](Structured::into_bytes) is called.
     pub fn write_byte_size(&mut self, byte_size: usize) {
-        self.deferred_sizes.push(byte_size);
+        self.deferred_sizes.push(DeferredSize {
+            start: self.content.len().saturating_sub(byte_size),
+            byte_size,
+        });
     }
 
     /// Finalize and return the byte sequence.
@@ -118,38 +128,30 @@ impl Structured {
             return result;
         }
 
-        // Size suffixes are read in LIFO order: the first deferred_size
-        // corresponds to the outermost arbitrary_byte_size call, which reads
-        // from the very end of the buffer. So we append them in reverse order.
+        // Size suffixes are stored in read order, but appended in reverse:
+        // the first `arbitrary_byte_size` call reads from the very end of the
+        // buffer, and each later call sees one fewer suffix plus any content
+        // consumed between calls.
         //
         // Each suffix's encoding depends on the total buffer length at the
         // time the reader calls arbitrary_byte_size. We iterate to find a
         // stable encoding.
-        let reversed: Vec<usize> = self.deferred_sizes.into_iter().rev().collect();
+        let deferred_sizes = self.deferred_sizes;
 
         // Start with 1-byte encoding for each suffix
-        let mut suffix_encodings: Vec<Vec<u8>> = reversed.iter().map(|_| vec![0u8]).collect();
+        let mut suffix_encodings: Vec<Vec<u8>> = deferred_sizes.iter().map(|_| vec![0u8]).collect();
 
         for _ in 0..5 {
-            let total_suffix_len: usize = suffix_encodings.iter().map(|s| s.len()).sum();
-            // reader_len = total length when the reader starts
-            let mut reader_len = result.len() + total_suffix_len;
-            let mut new_encodings = Vec::with_capacity(reversed.len());
+            let mut new_encodings = Vec::with_capacity(deferred_sizes.len());
 
-            for &desired_size in reversed.iter() {
+            for (idx, deferred_size) in deferred_sizes.iter().enumerate() {
                 // The reader has `reader_len` bytes remaining.
                 // arbitrary_byte_size determines encoding from reader_len.
-                let encoding = encode_byte_size(desired_size, reader_len);
-                let enc_len = encoding.len();
+                let remaining_suffix_len: usize =
+                    suffix_encodings[idx..].iter().map(|s| s.len()).sum();
+                let reader_len = result.len() - deferred_size.start + remaining_suffix_len;
+                let encoding = encode_byte_size(deferred_size.byte_size, reader_len);
                 new_encodings.push(encoding);
-
-                // After reading this suffix, reader_len decreases by enc_len
-                reader_len -= enc_len;
-                // After bytes(desired_size), reader_len decreases by desired_size
-                //
-                // But we need to handle the case where this is the innermost
-                // call — subsequent calls see the reduced buffer.
-                reader_len -= desired_size;
             }
 
             if new_encodings == suffix_encodings {
@@ -159,7 +161,7 @@ impl Structured {
             suffix_encodings = new_encodings;
         }
 
-        for encoding in suffix_encodings {
+        for encoding in suffix_encodings.into_iter().rev() {
             result.extend_from_slice(&encoding);
         }
 
@@ -271,5 +273,30 @@ mod tests {
         assert_eq!(inner_size, 2);
         let inner_data = u.bytes(inner_size).unwrap();
         assert_eq!(inner_data, &[4, 5]);
+    }
+
+    #[test]
+    fn encode_byte_size_roundtrip_with_interleaved_content() {
+        let mut s = Structured::new();
+        s.write_bytes(&[0xAA]);
+        s.write_bytes(&[1, 2, 3]);
+        s.write_byte_size(3);
+        s.write_bytes(&[0xBB]);
+        s.write_bytes(&[4, 5]);
+        s.write_byte_size(2);
+        let bytes = s.into_bytes();
+
+        let mut u = Unstructured::new(&bytes);
+        assert_eq!(u.bytes(1).unwrap(), &[0xAA]);
+
+        let first_size = u.arbitrary_byte_size_for_test();
+        assert_eq!(first_size, 3);
+        assert_eq!(u.bytes(first_size).unwrap(), &[1, 2, 3]);
+
+        assert_eq!(u.bytes(1).unwrap(), &[0xBB]);
+
+        let second_size = u.arbitrary_byte_size_for_test();
+        assert_eq!(second_size, 2);
+        assert_eq!(u.bytes(second_size).unwrap(), &[4, 5]);
     }
 }
